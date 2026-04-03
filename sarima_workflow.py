@@ -60,22 +60,19 @@ warnings.filterwarnings("ignore")
 DATA_PATH = "data/train.csv"
 PLOTS_DIR = "plots"
 
-# Seasonal period.
-# WHY s=7? The data is daily sales. Retail demand cycles weekly: higher on
-# weekends, lower mid-week (or vice versa). A weekly period (s=7) is the
-# dominant short cycle in most retail data and is confirmed empirically
-# by the periodogram in Section 2.
-# WHY NOT s=365 (annual)? Annual seasonality exists, but SARIMA handles
-# only one seasonal period. With 7 years of data, s=7 provides far more
-# seasonal cycles for estimation (371 cycles vs. 7). For multi-seasonality,
-# TBATS or Prophet would be more appropriate.
-SEASONAL_PERIOD = 7
+# Seasonal period fallback.
+# s is NO LONGER hardcoded. It is detected empirically in Section 2 by the
+# periodogram and passed as a local variable (dominant_s) through the pipeline.
+# This fallback is used only if the periodogram finds no peaks above the
+# detection threshold — an unlikely edge case on real data.
+# WHY 7 as fallback? Weekly is the most common retail seasonal period and the
+# prior most practitioners would reach for before running any diagnostics.
+SEASONAL_PERIOD_FALLBACK = 7
 
 # Hold out the last 90 days as an out-of-sample test set.
-# WHY 90 days? 90 days covers ~13 weekly seasonal cycles, providing a
-# statistically meaningful evaluation window. Using fewer days (e.g., 30)
-# covers only 4 cycles and may not represent seasonal variation adequately.
-# Using more (e.g., 180) reduces training data significantly.
+# WHY 90 days? A fixed horizon independent of s: it represents the business
+# question "how well can this model forecast three months ahead?" regardless
+# of what seasonal period the data turns out to have.
 TEST_DAYS = 90
 
 # Significance threshold for all hypothesis tests (ADF, KPSS, Ljung-Box).
@@ -84,20 +81,30 @@ TEST_DAYS = 90
 # under-differencing. Using 0.10 increases false positives (over-differencing).
 ALPHA = 0.05
 
-# Grid search bounds.
-# WHY p, q <= 2 (range 0..3 exclusive)? ARMA theory shows that most real
-# processes are well-approximated with p, q <= 2. Orders above 3 rarely
-# improve out-of-sample performance and risk overfitting. They also increase
-# computation time super-linearly.
-# WHY P, Q <= 1 (range 0..2 exclusive)? For weekly seasonality, P=1 or Q=1
-# captures one lag of seasonal autocorrelation, which is almost always sufficient.
-# P=2 or Q=2 means the model looks at two seasons back (14 days), which is
-# rarely necessary.
-# TOTAL COMBINATIONS: 3 * 3 * 2 * 2 = 36, making the search tractable.
-P_RANGE = range(0, 3)       # AR non-seasonal: 0, 1, 2
-Q_RANGE = range(0, 3)       # MA non-seasonal: 0, 1, 2
-SEASONAL_P_RANGE = range(0, 2)  # AR seasonal: 0, 1
-SEASONAL_Q_RANGE = range(0, 2)  # MA seasonal: 0, 1
+# Informed grid search bounds — derived from sarima_run.log (first full run).
+#
+# What the previous run showed:
+#   - Every model in the top 5 had q=2. No model with q<2 appeared there.
+#   - p=0 never placed in the top 5 regardless of other orders.
+#   - Q=1 was present in all top-5 models; Q=0 was never competitive.
+#   - P was marginal: P=1 won (AIC -13583) but P=0 was close (AIC -13565).
+#
+# Grid design:
+#   - Start p at 1 (not 0): p=0 was consistently outperformed.
+#   - Extend p to 3: the winning p=2 may not be the ceiling; p=3 is the next
+#     unexplored candidate.
+#   - Start q at 2 (not 0): q<2 was never in the top 5.
+#   - Extend q to 3: same reasoning as p — one step beyond the known best.
+#   - Keep P in {0,1}: P=1 won but P=0 was close; both are worth retesting
+#     with the new s value.
+#   - Fix Q=1: Q=0 was never competitive. Fixing it saves 50% of combinations.
+#
+# TOTAL COMBINATIONS: 3 × 2 × 2 × 1 = 12  (vs 36 previously — 3× faster,
+# better coverage of the promising region of parameter space).
+P_RANGE = range(1, 4)          # AR non-seasonal: 1, 2, 3
+Q_RANGE = range(2, 4)          # MA non-seasonal: 2, 3
+SEASONAL_P_RANGE = range(0, 2) # AR seasonal: 0, 1
+SEASONAL_Q_RANGE = range(1, 2) # MA seasonal: 1 only
 
 
 # =============================================================================
@@ -441,27 +448,56 @@ def plot_periodogram(series):
     mask = (periods >= 2) & (periods <= 400)
     periods, power = periods[mask], power[mask]
 
-    # Identify top-5 peaks.
+    # Identify peaks above the 95th percentile of spectral power.
+    # WHY 95th percentile threshold? It isolates the top 5% of spectral mass,
+    # filtering out the broad low-power background and surfacing only the
+    # genuinely dominant periodic components. A lower threshold (e.g., 50th
+    # percentile) would return dozens of spurious peaks; a higher one (99th)
+    # risks missing real but modest seasonal cycles.
     from scipy.signal import find_peaks
     peaks_idx, _ = find_peaks(power, height=np.percentile(power, 95))
+
+    if len(peaks_idx) == 0:
+        # No peaks detected: fall back to the configured default.
+        # This should not happen on real sales data but guards against
+        # degenerate inputs (e.g., a constant or near-constant series).
+        print(f"\n    WARNING: No spectral peaks detected. "
+              f"Falling back to s={SEASONAL_PERIOD_FALLBACK}.")
+        return np.array([]), SEASONAL_PERIOD_FALLBACK
+
     peak_periods = periods[peaks_idx]
+    peak_powers  = power[peaks_idx]
+
+    # Select the dominant period: the peak carrying the most spectral power.
+    # WHY highest power rather than, e.g., shortest period?
+    # The highest-power peak represents the cycle that explains the most
+    # variance in the series. That is the cycle SARIMA should be parameterised
+    # to model — it has the greatest impact on forecast quality.
+    # A bias toward short periods (like s=7) would be ad hoc and could miss
+    # a dominant longer cycle that the data actually exhibits.
+    dominant_idx    = np.argmax(peak_powers)
+    dominant_period = int(round(peak_periods[dominant_idx]))
 
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.semilogy(periods, power, color="steelblue", linewidth=0.9)
     for pp in peak_periods[:5]:
         ax.axvline(x=pp, color="red", linestyle="--", linewidth=1.2,
                    label=f"s ≈ {pp:.1f}")
+    # Highlight the dominant period distinctly.
+    ax.axvline(x=peak_periods[dominant_idx], color="darkred", linestyle="-",
+               linewidth=2.0, label=f"dominant: s={dominant_period}")
     ax.set_xlabel("Period (days)")
     ax.set_ylabel("Power (log scale)")
     ax.set_title("Section 2 — Seasonality: Periodogram\n"
-                 "(dominant peaks indicate seasonal periods; expect spikes near 7 and 365)")
+                 f"Dominant period (highest power): s = {dominant_period} days")
     ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.25)
     plt.tight_layout()
     _save(fig, "02_periodogram.png")
 
-    print(f"\n    Top seasonal periods detected: {[f'{p:.1f}' for p in sorted(peak_periods[:5])]}")
-    return peak_periods
+    print(f"\n    All detected periods: {[f'{p:.1f}' for p in sorted(peak_periods[:5])]}")
+    print(f"    Dominant period (highest spectral power): s = {dominant_period}")
+    return peak_periods, dominant_period
 
 
 def plot_stl_decomposition(series, s):
@@ -777,7 +813,7 @@ def evaluate_forecast(best_fit, train, test, best_order, best_season,
 # SECTION 5: RESIDUAL DIAGNOSTICS
 # =============================================================================
 
-def plot_residual_diagnostics(best_fit, best_order, best_season):
+def plot_residual_diagnostics(best_fit, best_order, best_season, s=SEASONAL_PERIOD_FALLBACK):
     """
     Comprehensive residual diagnostics to verify the model's residuals are
     white noise (no remaining structure).
@@ -876,17 +912,17 @@ def plot_residual_diagnostics(best_fit, best_order, best_season):
     # making it more accurate for small to moderate samples. For large n both
     # give similar results, but Ljung-Box is the standard default.
     #
-    # WHY lags=[10, 20, SEASONAL_PERIOD]?
+    # WHY lags=[10, 20, s]?
     # Lag 10 and 20 are conventional choices (Box and Jenkins original recommendation
     # was max lag ~ sqrt(n), here ~50, but short lags detect most AR/MA misspecification).
-    # Testing at lag=SEASONAL_PERIOD directly checks whether seasonal autocorrelation
-    # was adequately removed — the most likely failure mode for SARIMA.
+    # Testing at lag=s directly checks whether seasonal autocorrelation was adequately
+    # removed — the most likely failure mode for SARIMA.
     #
     # INTERPRETATION:
     #   p-value > 0.05 at all lags → residuals appear white noise → model adequate.
     #   p-value <= 0.05 at any lag → remaining autocorrelation → consider increasing
     #   the corresponding AR/MA or seasonal AR/MA order.
-    lb_lags = sorted(set([10, 20, SEASONAL_PERIOD]))
+    lb_lags = sorted(set([10, 20, s]))
     lb_result = acorr_ljungbox(std_resid, lags=lb_lags, return_df=True)
 
     print(f"\n    Ljung-Box test (H0: residuals are white noise):")
@@ -1202,8 +1238,10 @@ def main():
     plot_acf_pacf(log_series,
                   "Section 1 — ACF/PACF: Log-Transformed Series (pre-differencing)",
                   "01_acf_pacf_original",
-                  lags=60,
-                  seasonal_period=SEASONAL_PERIOD)
+                  lags=60)
+    # WHY no seasonal_period markers here? s is determined empirically in
+    # Section 2 (periodogram), which runs after this plot. Marking arbitrary
+    # seasonal lags before the detection step would be misleading.
 
     print("\n  Testing stationarity of the log-transformed series:")
     is_stationary = check_stationarity(log_series, "log-transformed series")
@@ -1212,27 +1250,35 @@ def main():
 
     # ---- Section 2: Seasonality ------------------------------------------
     print_section(2, "SEASONALITY DETECTION")
-    plot_periodogram(log_series)
-    plot_stl_decomposition(log_series, SEASONAL_PERIOD)
-    print(f"\n  → Confirmed seasonal period: s = {SEASONAL_PERIOD} (weekly cycle)")
+    _, dominant_s = plot_periodogram(log_series)
+    # dominant_s is the period (in days) of the highest-power spectral peak,
+    # rounded to the nearest integer. All downstream sections use this value
+    # rather than a hardcoded constant — making the choice of s data-driven.
+    plot_stl_decomposition(log_series, dominant_s)
+    print(f"\n  → Empirically detected seasonal period: s = {dominant_s} days")
 
     # ---- Section 3: ACF/PACF after differencing --------------------------
     print_section(3, "ACF/PACF AFTER DIFFERENCING")
-    print(f"\n  Differencing: d={d} (non-seasonal), D=1 (seasonal, lag={SEASONAL_PERIOD})")
-    stationary_series = difference_and_verify(log_series, d=d, D=1, s=SEASONAL_PERIOD)
+    print(f"\n  Differencing: d={d} (non-seasonal), D=1 (seasonal, lag={dominant_s})")
+    stationary_series = difference_and_verify(log_series, d=d, D=1, s=dominant_s)
     plot_acf_pacf(
         stationary_series,
-        f"Section 3 — ACF/PACF: Stationary Series (d={d}, D=1, s={SEASONAL_PERIOD})\n"
-        f"Orange dashed lines mark seasonal lags (multiples of {SEASONAL_PERIOD})",
+        f"Section 3 — ACF/PACF: Stationary Series (d={d}, D=1, s={dominant_s})\n"
+        f"Orange dashed lines mark seasonal lags (multiples of {dominant_s})",
         "03_acf_pacf_differenced",
-        lags=60,
-        seasonal_period=SEASONAL_PERIOD,
+        lags=min(60, dominant_s * 3),
+        # WHY min(60, dominant_s * 3)? With a large s (e.g. 182), showing
+        # only 60 lags would not reach even one seasonal lag. Extending to
+        # 3× the seasonal period ensures the ACF/PACF plot always shows
+        # enough seasonal repetition to read off P and Q. Capped to avoid
+        # excessively wide plots when s is small.
+        seasonal_period=dominant_s,
     )
     print("\n  Reading guide:")
     print("    PACF: count non-seasonal spikes before first cut-off → candidate p")
     print("    ACF : count non-seasonal spikes before first cut-off → candidate q")
-    print(f"    PACF at lags {SEASONAL_PERIOD},{2*SEASONAL_PERIOD}: spikes → candidate P")
-    print(f"    ACF  at lags {SEASONAL_PERIOD},{2*SEASONAL_PERIOD}: spikes → candidate Q")
+    print(f"    PACF at lags {dominant_s},{2*dominant_s}: spikes → candidate P")
+    print(f"    ACF  at lags {dominant_s},{2*dominant_s}: spikes → candidate Q")
 
     # ---- Section 4: Grid Search (baseline, no holiday exog) -------------
     print_section(4, "GRID SEARCH (statsmodels SARIMAX, AIC)")
@@ -1242,7 +1288,7 @@ def main():
           f"({test.index.min().date()} to {test.index.max().date()})")
 
     best_fit, best_order, best_season, results_df = grid_search_sarima(
-        train, d=d, D=1, s=SEASONAL_PERIOD
+        train, d=d, D=1, s=dominant_s
     )
 
     print(f"\n  Best model: SARIMA{best_order}×{best_season}")
@@ -1256,7 +1302,7 @@ def main():
 
     # ---- Section 5: Residual Diagnostics ---------------------------------
     print_section(5, "RESIDUAL DIAGNOSTICS")
-    plot_residual_diagnostics(best_fit, best_order, best_season)
+    plot_residual_diagnostics(best_fit, best_order, best_season, s=dominant_s)
 
     # ---- Section 6: Holiday Exogenous Variable ---------------------------
     print_section(6, "HOLIDAY EXOGENOUS VARIABLE (SARIMAX)")
