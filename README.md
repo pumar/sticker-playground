@@ -10,6 +10,10 @@ Forecast daily sticker sales for 2017–2019 across 90 time series (5 products �
 
 A classical SARIMA methodology, documented step by step in [`SARIMA_process.txt`](SARIMA_process.txt). Rather than a single model fit, the workflow builds understanding incrementally — stationarity testing, seasonality detection, ACF/PACF reading — before arriving at a model through grid search.
 
+STL decomposition reveals a stable weekly seasonal component (green) and a rising long-term trend (orange), with isolated spikes in the residual panel pointing to holiday and annual-cycle events the weekly model cannot absorb.
+
+![STL Decomposition](plots/02_stl_decomposition.png)
+
 Two complementary models address distinct seasonal structures in the data:
 
 | Model | Seasonal period | Captures |
@@ -31,7 +35,15 @@ Evaluated on a held-out test window (last 90 days of training data for the daily
 | Daily SARIMA + holiday exog | — | — | — |
 | Weekly SARIMA (s=52) | 12,771 | 17,603 | 3.06% |
 
-The weekly model's lower MAPE (3.06% vs 3.35%) confirms that annual seasonality is a meaningful error source in the daily model. Its RMSE/MAE ratio of 1.38× vs 2.2× for the daily model indicates the large residual spikes in the daily model are partially explained by annual-scale events that the weekly model captures directly.
+**Daily model** — 90-day out-of-sample forecast. The weekly cycle is tracked well; the widening prediction interval toward year-end reflects compounding uncertainty over a 90-step horizon.
+
+![Daily SARIMA forecast](plots/04_forecast.png)
+
+**Weekly model** — 13-week out-of-sample forecast. The annual-scale peaks (e.g., end-of-year spikes visible in the training window) are captured by the s=52 seasonal structure, explaining the MAPE improvement from 3.35% to 3.06%.
+
+![Weekly SARIMA forecast](plots/07_weekly_forecast.png)
+
+The weekly model's lower MAPE confirms that annual seasonality is a meaningful error source in the daily model. Its RMSE/MAE ratio of 1.38× vs 2.2× for the daily model indicates the large residual spikes in the daily model are partially explained by annual-scale events that the weekly model captures directly.
 
 > MAE and RMSE for the weekly model are in weekly units (~7× daily volume); use MAPE for cross-model comparison.
 
