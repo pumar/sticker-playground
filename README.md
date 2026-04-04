@@ -18,8 +18,8 @@ Two complementary models address distinct seasonal structures in the data:
 
 | Model | Seasonal period | Captures |
 |---|---|---|
-| SARIMA(2,1,2)(1,1,1)[7] | s = 7 | Weekly demand cycle |
-| SARIMA(2,1,2)(0,1,0,52] | s = 52 | Annual demand cycle (weekly aggregation) |
+| SARIMA(3,1,3)(1,1,1)[7] | s = 7 | Weekly demand cycle |
+| SARIMA(2,1,0)(1,1,0)[52] | s = 52 | Annual demand cycle (weekly aggregation) |
 
 A SARIMAX extension adds a binary public holiday indicator (across all four countries in the dataset) as an exogenous regressor to absorb demand spikes that the ARIMA structure cannot model.
 
@@ -31,9 +31,9 @@ Evaluated on a held-out test window (last 90 days of training data for the daily
 
 | Model | MAE | RMSE | MAPE |
 |---|---|---|---|
-| Daily SARIMA — baseline | 2,226 | 4,994 | 3.35% |
-| Daily SARIMA + holiday exog | 2,218 | 4,989 | 3.33% |
-| Weekly SARIMA (s=52) | 12,771 | 17,603 | 3.06% |
+| Daily SARIMA — baseline | 2,720 | 5,295 | 4.18% |
+| Daily SARIMA + holiday exog | 2,317 | 5,063 | 3.50% |
+| Weekly SARIMA (s=52) | 9,570 | 12,499 | 2.30% |
 
 **Daily model** — 90-day out-of-sample forecast. The weekly cycle is tracked well; the widening prediction interval toward year-end reflects compounding uncertainty over a 90-step horizon.
 

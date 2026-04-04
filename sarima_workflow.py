@@ -239,9 +239,12 @@ def run_adf_test(series, label="series"):
     stat, p_value = result[0], result[1]
     is_stationary = p_value <= ALPHA
 
+    # ADF p-values at machine precision display as "0.0000" with .4f format,
+    # which looks like an exact zero and is misleading. Use "< 0.0001" instead.
+    p_display = "< 0.0001" if p_value < 0.0001 else f"{p_value:.4f}"
     print(f"\n    ADF on {label}:")
     print(f"      Statistic : {stat:.4f}")
-    print(f"      p-value   : {p_value:.4f}  →  "
+    print(f"      p-value   : {p_display}  →  "
           + ("STATIONARY ✓" if is_stationary else "NON-STATIONARY ✗")
           + f"  (threshold = {ALPHA})")
     return is_stationary, p_value
@@ -286,9 +289,18 @@ def run_kpss_test(series, label="series"):
     stat, p_value = result[0], result[1]
     is_stationary = p_value > ALPHA
 
+    # statsmodels KPSS bounds p-values to [0.01, 0.10]. Displaying these as
+    # exact values is misleading: p=0.01 means actual p ≤ 0.01, and p=0.10
+    # means actual p ≥ 0.10. Annotate boundaries explicitly.
+    if p_value <= 0.01:
+        p_display = f"≤ 0.01"
+    elif p_value >= 0.10:
+        p_display = f"≥ 0.10"
+    else:
+        p_display = f"{p_value:.4f}"
     print(f"\n    KPSS on {label}:")
     print(f"      Statistic : {stat:.4f}")
-    print(f"      p-value   : {p_value:.4f}  →  "
+    print(f"      p-value   : {p_display}  →  "
           + ("STATIONARY ✓" if is_stationary else "NON-STATIONARY ✗")
           + f"  (threshold = {ALPHA})")
     return is_stationary, p_value
@@ -495,7 +507,14 @@ def plot_periodogram(series):
     plt.tight_layout()
     _save(fig, "02_periodogram.png")
 
-    print(f"\n    All detected periods: {[f'{p:.1f}' for p in sorted(peak_periods[:5])]}")
+    # Print the 5 peaks with the highest spectral power (not the first 5 by
+    # array position). The periods array is descending (large → small) because
+    # periods = 1/freqs and freqs are ascending from the FFT. peak_periods[:5]
+    # would therefore show the 5 longest-period peaks — misleading when the
+    # dominant period (s=7) sits near the end of the array.
+    # Sorting by power descending before slicing gives the genuinely strongest peaks.
+    top5_by_power = peak_periods[np.argsort(peak_powers)[::-1][:5]]
+    print(f"\n    Top 5 periods by spectral power: {[f'{p:.1f}' for p in top5_by_power]}")
     print(f"    Dominant period (highest spectral power): s = {dominant_period}")
     return peak_periods, dominant_period
 
@@ -605,7 +624,7 @@ def difference_and_verify(series, d, D, s):
 # SECTION 4: GRID SEARCH
 # =============================================================================
 
-def grid_search_sarima(train, d, D, s, exog=None,
+def grid_search_sarima(train, d, D, s, exog=None, val_fraction=0.15,
                        p_range=None, q_range=None,
                        sp_range=None, sq_range=None):
     """
@@ -623,38 +642,68 @@ def grid_search_sarima(train, d, D, s, exog=None,
     compares likelihood on the *same* response variable, but differencing changes
     the response. Fixing d and D ensures all AIC values are comparable.
 
-    WHY AIC OVER BIC FOR MODEL SELECTION?
-    AIC = 2k - 2*ln(L)
-    BIC = k*ln(n) - 2*ln(L)
-    BIC penalizes model size more (k*ln(n) vs 2k). For large n (thousands of
-    observations), BIC strongly favors very parsimonious models that may
-    under-capture the seasonal structure. AIC is the standard criterion when
-    the goal is predictive accuracy (forecasting), not parsimony for its own sake.
+    WHY VALIDATION MAPE OVER AIC FOR MODEL SELECTION?
+    Run 2 demonstrated the failure mode of AIC-based selection: expanding the
+    grid to p=3, q=3 produced SARIMA(3,1,3) with AIC=-13698 (better than run 1's
+    -13583), but MAPE=4.05% (worse than run 1's 3.35%). Both AIC and BIC preferred
+    the overfit model in-sample — BIC for (3,1,3) was -13651, still beating run 1's
+    -13543. Neither in-sample criterion was able to prevent the overfitting.
 
-    WHY enforce_stationarity=False and enforce_invertibility=False?
-    During grid search, we test all combinations. Letting statsmodels reject
+    The root cause: high-order ARMA models can have near-canceling AR and MA
+    polynomial roots, which inflates the log-likelihood on training data while
+    adding no genuine predictive structure. This is a known pathology of ARMA
+    order selection by information criteria on finite samples.
+
+    The direct fix is to select by *out-of-sample* performance. We split the
+    training data into a sub-training window and an internal validation window,
+    fit each candidate on sub-training, forecast the validation window, and
+    select the model with the lowest validation MAPE. The winner is then refit
+    on the full training set so the final model benefits from all available data.
+
+    WHY VALIDATION MAPE SPECIFICALLY?
+    MAPE is the competition evaluation metric. Optimising directly for it during
+    model selection aligns the grid search objective with the final evaluation
+    criterion. AIC optimises log-likelihood (a different objective).
+
+    WHY val_fraction=0.15 (15%)?
+    With ~2,467 training observations and s=7, 15% ≈ 370 observations ≈ 53
+    seasonal cycles — more than enough for a stable MAPE estimate. A smaller
+    fraction (e.g. 5%) risks a noisy MAPE estimate; a larger one (e.g. 30%)
+    leaves too little data for sub-training.
+
+    KNOWN LIMITATION — SINGLE-WINDOW TEMPORAL CROSS-VALIDATION:
+    The val window always covers the final val_fraction of the training set.
+    If the test period falls in a seasonally distinct sub-period (e.g. Q4
+    holiday season) that is under-represented in the val window, the selected
+    model may not be optimal for the test window even with perfect val_MAPE.
+    Run 3 illustrated this: the val window (~Q4 2015 through Q3 2016) preceded
+    the test window (Q4 2016), so models were selected for non-holiday-peak
+    performance and generalised poorly to holiday-peak Q4.
+    The correct fix is rolling-origin cross-validation (multiple val windows
+    spanning all seasons), but this multiplies grid-search compute by 5–7×.
+    For a methodology demo, the single-window approach is an acceptable
+    trade-off; for production, rolling CV should replace it.
+
+    WHY ENFORCE_STATIONARITY=False AND ENFORCE_INVERTIBILITY=False?
+    During grid search we test all combinations. Letting statsmodels reject
     non-invertible/non-stationary parameter configurations internally would skip
     potentially useful combinations silently. We disable these checks during the
     search and rely on residual diagnostics to verify the final model.
 
     Parameters
     ----------
-    train    : pd.Series — training portion of the log-transformed series.
-    d        : int
-    D        : int
-    s        : int
-    exog     : pd.DataFrame or None — optional exogenous regressors aligned to train.
-               If provided, each model is fitted with these covariates. Must have
-               the same index as train.
-    p_range, q_range, sp_range, sq_range : range objects — override module defaults
-               when the weekly model calls this function with different bounds.
+    train        : pd.Series — training portion of the log-transformed series.
+    d, D, s      : int — differencing orders and seasonal period.
+    exog         : pd.DataFrame or None — exogenous regressors aligned to train.
+    val_fraction : float — fraction of train held out for internal validation.
+    p_range, q_range, sp_range, sq_range : range — override module-level defaults.
 
     Returns
     -------
-    best_fit        : SARIMAX fitted model object
-    best_order      : (p, d, q) tuple
-    best_season     : (P, D, Q, s) tuple
-    results_df      : pd.DataFrame — all tested combinations and their AIC.
+    best_fit     : SARIMAX model refit on full train with the best-validated order.
+    best_order   : (p, d, q)
+    best_season  : (P, D, Q, s)
+    results_df   : pd.DataFrame with AIC and val_MAPE for every combination tested.
     """
     _p  = p_range  if p_range  is not None else P_RANGE
     _q  = q_range  if q_range  is not None else Q_RANGE
@@ -664,16 +713,34 @@ def grid_search_sarima(train, d, D, s, exog=None,
     combos = list(itertools.product(_p, _q, _sp, _sq))
     total = len(combos)
 
+    # Internal train/validation split.
+    # val_size floor is 21 observations (3 weeks), not s*3.
+    # The old s*3 floor was designed to guarantee "at least 3 seasonal cycles"
+    # but is pathological for large s: with s=52 (weekly), s*3=156 obs forces
+    # 44% of the weekly training set into validation, leaving only 197 obs for
+    # sub-training — far too little to fit a seasonal model. One full annual
+    # cycle (52 obs, what val_fraction=0.15 naturally gives for s=52) is
+    # sufficient to estimate val_MAPE reliably. A flat 21-obs floor protects
+    # against degenerate edge cases (very short series or tiny val_fraction)
+    # without penalising large-s applications.
+    val_size = max(int(len(train) * val_fraction), 21)
+    train_sub = train.iloc[:-val_size]
+    val       = train.iloc[-val_size:]
+    exog_sub  = exog.iloc[:-val_size] if exog is not None else None
+    exog_val  = exog.iloc[-val_size:] if exog is not None else None
+
     print(f"\n    Grid: p∈{list(_p)}, q∈{list(_q)}, "
           f"P∈{list(_sp)}, Q∈{list(_sq)}")
     print(f"    Fixed: d={d}, D={D}, s={s}")
     print(f"    Exog columns: {list(exog.columns) if exog is not None else 'none'}")
-    print(f"    Total combinations: {total}  (this may take 10-25 min)\n")
+    print(f"    Selection criterion: validation MAPE  "
+          f"(sub-train={len(train_sub)}, val={len(val)} obs)")
+    print(f"    Total combinations: {total}\n")
 
-    best_aic = np.inf
-    best_fit = None
-    best_order = None
-    best_season = None
+    best_mape = np.inf
+    best_fit_sub = None   # fitted on train_sub — used only for selection
+    best_order   = None
+    best_season  = None
     records = []
 
     for i, (p, q, sp, sq) in enumerate(combos):
@@ -681,48 +748,74 @@ def grid_search_sarima(train, d, D, s, exog=None,
         seasonal_order = (sp, D, sq, s)
         try:
             model = SARIMAX(
-                train,
-                exog=exog,
+                train_sub,
+                exog=exog_sub,
                 order=order,
                 seasonal_order=seasonal_order,
                 enforce_stationarity=False,
                 enforce_invertibility=False,
                 trend="n",
                 # WHY trend='n'? Including an explicit intercept (trend='c') is
-                # redundant when d=1: the differencing already removes the mean
-                # of the original series. Adding a constant to a differenced
-                # series estimates a linear drift, which is rarely appropriate
-                # for sales data and would be a separate modeling decision.
+                # redundant when d >= 1: differencing already removes the mean.
+                # Adding a constant to a differenced series estimates a linear
+                # drift — rarely appropriate for retail sales data.
             )
-            fit = model.fit(disp=False, method="lbfgs", maxiter=200)
-            # WHY method='lbfgs'? L-BFGS is a quasi-Newton optimizer that
-            # converges reliably for SARIMAX likelihoods. The default 'newton'
-            # can be unstable for some parameter configurations during grid search.
-            # WHY maxiter=200? Default (50) sometimes fails to converge; 200
-            # is sufficient for the problem size without excessive compute.
+            fit_sub = model.fit(disp=False, method="lbfgs", maxiter=200)
+            # WHY lbfgs? L-BFGS is a quasi-Newton optimizer that converges
+            # reliably for SARIMAX likelihoods. The default 'newton' can be
+            # unstable for some parameter combinations during grid search.
 
-            aic = fit.aic
-            records.append({"p": p, "d": d, "q": q,
-                             "P": sp, "D": D, "Q": sq, "AIC": round(aic, 2)})
+            # Forecast the validation window and compute MAPE on original scale.
+            # WHY original scale? MAPE on log scale is not the competition metric
+            # and does not correspond to the error stakeholders care about.
+            fc = fit_sub.get_forecast(steps=len(val), exog=exog_val)
+            fc_orig  = np.expm1(fc.predicted_mean.values)
+            val_orig = np.expm1(val.values)
+            val_mape = float(np.mean(np.abs((val_orig - fc_orig) / val_orig)) * 100)
 
-            if aic < best_aic:
-                best_aic = aic
-                best_fit = fit
-                best_order = order
-                best_season = seasonal_order
+            aic = fit_sub.aic
+            records.append({"p": p, "d": d, "q": q, "P": sp, "D": D, "Q": sq,
+                             "AIC": round(aic, 2), "val_MAPE": round(val_mape, 4)})
+
+            if val_mape < best_mape:
+                best_mape    = val_mape
+                best_fit_sub = fit_sub
+                best_order   = order
+                best_season  = seasonal_order
                 print(f"    [{i+1:2d}/{total}] New best: "
-                      f"SARIMA{order}x{seasonal_order} AIC={aic:.2f}")
-            elif (i + 1) % 9 == 0:
+                      f"SARIMA{order}x{seasonal_order} "
+                      f"val_MAPE={val_mape:.4f}%  AIC={aic:.2f}")
+            elif (i + 1) % 4 == 0:
                 print(f"    [{i+1:2d}/{total}] Best still: "
-                      f"SARIMA{best_order}x{best_season} AIC={best_aic:.2f}")
+                      f"SARIMA{best_order}x{best_season} "
+                      f"val_MAPE={best_mape:.4f}%")
 
         except Exception:
-            records.append({"p": p, "d": d, "q": q,
-                             "P": sp, "D": D, "Q": sq, "AIC": np.nan})
+            records.append({"p": p, "d": d, "q": q, "P": sp, "D": D, "Q": sq,
+                             "AIC": np.nan, "val_MAPE": np.nan})
 
-    results_df = pd.DataFrame(records).sort_values("AIC")
-    print(f"\n    Top 5 models by AIC:")
+    results_df = (pd.DataFrame(records)
+                  .sort_values("val_MAPE")
+                  .reset_index(drop=True))
+    print(f"\n    Top 5 models by validation MAPE:")
     print(results_df.head(5).to_string(index=False))
+
+    # Refit the best-order model on the FULL training set.
+    # WHY refit? The selection step used only a sub-training window to avoid
+    # contaminating the validation signal. The final model should see all
+    # available training data so its parameters are estimated with maximum
+    # precision before forecasting the test window.
+    print(f"\n    Refitting SARIMA{best_order}×{best_season} on full training set ...")
+    final_model = SARIMAX(
+        train,
+        exog=exog,
+        order=best_order,
+        seasonal_order=best_season,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+        trend="n",
+    )
+    best_fit = final_model.fit(disp=False, method="lbfgs", maxiter=200)
 
     return best_fit, best_order, best_season, results_df
 
@@ -1065,8 +1158,13 @@ def refit_with_holiday_exog(best_order, best_season, train, test,
     # The magnitude tells us how much: e.g., coef=0.1 → ~10% uplift in original scale
     # (because the model is on the log scale: exp(0.1) ≈ 1.105).
     coef = fit.params.get("is_holiday", np.nan)
+    # Use adaptive precision: .1f rounds tiny effects to "-0.0%", which is
+    # actively misleading. Switch to .2f when |pct| < 1 to preserve the sign
+    # and magnitude (e.g. "-0.05%" instead of "-0.0%").
+    pct_change = 100 * np.expm1(coef)
+    pct_str = f"{pct_change:.2f}%" if abs(pct_change) < 1.0 else f"{pct_change:.1f}%"
     print(f"    Estimated holiday coefficient: {coef:.4f}  "
-          f"(≈ {100 * (np.expm1(coef)):.1f}% change in units sold on holidays)")
+          f"(≈ {pct_str} change in units sold on holidays)")
     print(f"    AIC with holidays: {fit.aic:.2f}  |  BIC: {fit.bic:.2f}")
 
     mae, rmse, mape = evaluate_forecast(
@@ -1274,14 +1372,14 @@ def main():
         # excessively wide plots when s is small.
         seasonal_period=dominant_s,
     )
-    print("\n  Reading guide:")
-    print("    PACF: count non-seasonal spikes before first cut-off → candidate p")
-    print("    ACF : count non-seasonal spikes before first cut-off → candidate q")
-    print(f"    PACF at lags {dominant_s},{2*dominant_s}: spikes → candidate P")
-    print(f"    ACF  at lags {dominant_s},{2*dominant_s}: spikes → candidate Q")
+    # NOTE: No reading guide printed here. Section 3 is purely diagnostic —
+    # inspect plots/03_acf_pacf_differenced.png manually if you want to
+    # cross-check grid search ranges. The grid in Section 4 is the sole
+    # source of order selection; printing ACF/PACF heuristics here would
+    # imply they feed into the model, which they do not.
 
     # ---- Section 4: Grid Search (baseline, no holiday exog) -------------
-    print_section(4, "GRID SEARCH (statsmodels SARIMAX, AIC)")
+    print_section(4, "GRID SEARCH (statsmodels SARIMAX, val_MAPE)")
     train = log_series.iloc[:-TEST_DAYS]
     test = log_series.iloc[-TEST_DAYS:]
     print(f"\n  Train: {len(train)} obs  |  Test: {len(test)} obs "
